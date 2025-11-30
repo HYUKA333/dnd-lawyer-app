@@ -1,78 +1,72 @@
-"""
-模块: Retriever (BM25)
-基于原 retriever.py 改造，改为类实例模式，支持动态重新加载。
-"""
 import os
 import pickle
 import jieba
 import numpy as np
-from typing import List
+from typing import List, Optional
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
-
 class BM25Retriever:
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        self.index_dir = os.path.join(data_dir, "vector_store")
-
-        self.bm25_model_path = os.path.join(self.index_dir, "bm25_model.pkl")
-        self.documents_path = os.path.join(self.index_dir, "documents.pkl")
-
-        self.bm25_model: BM25Okapi = None
+    def __init__(self, lib_path: str = None):
+        self.bm25_model: Optional[BM25Okapi] = None
         self.documents: List[Document] = []
         self.loaded = False
+        self.current_lib_path = lib_path
 
-    def load_index(self):
-        """加载磁盘上的索引文件"""
-        if not os.path.exists(self.bm25_model_path) or not os.path.exists(self.documents_path):
-            raise FileNotFoundError("Index files not found. Please build index first.")
+        if lib_path:
+            self.load_index(lib_path)
 
-        # 加载自定义词典（如果有）
-        dict_path = os.path.join(self.data_dir, "dnd_terms.txt")
-        if os.path.exists(dict_path):
-            jieba.load_userdict(dict_path)
+    def load_index(self, lib_path: str):
+        """热加载指定库的索引"""
+        self.current_lib_path = lib_path
+        index_dir = os.path.join(lib_path, "vector_store")
+        model_path = os.path.join(index_dir, "bm25_model.pkl")
+        docs_path = os.path.join(index_dir, "documents.pkl")
 
-        with open(self.documents_path, 'rb') as f:
-            self.documents = pickle.load(f)
+        if not os.path.exists(model_path):
+            print(f"Index not found: {index_dir}")
+            self.loaded = False
+            return
 
-        with open(self.bm25_model_path, 'rb') as f:
-            self.bm25_model = pickle.load(f)
+        # 尝试加载项目根目录下的自定义词典
+        root_dict = os.path.join("data", "dnd_terms.txt")
+        if os.path.exists(root_dict):
+            jieba.load_userdict(root_dict)
 
-        self.loaded = True
+        try:
+            with open(docs_path, 'rb') as f:
+                self.documents = pickle.load(f)
+
+            with open(model_path, 'rb') as f:
+                self.bm25_model = pickle.load(f)
+
+            self.loaded = True
+        except Exception as e:
+            print(f"Error loading index: {e}")
+            self.loaded = False
 
     def search(self, query: str, top_k: int = 10, blacklist_paths: List[str] = None) -> List[Document]:
-        if not self.loaded:
-            self.load_index()
+        if not self.loaded: return []
+        if blacklist_paths is None: blacklist_paths = []
 
-        if blacklist_paths is None:
-            blacklist_paths = []
-
-        # 1. 分词
         tokenized_query = jieba.lcut(query)
-
-        # 2. 打分
         scores = self.bm25_model.get_scores(tokenized_query)
 
-        # 3. 排序
-        # 简单的优化：只取前 top_k * 5 个候选，然后过滤
-        candidate_limit = min(max(top_k * 5, 50), len(self.documents))
-        candidate_indices = np.argsort(scores)[-candidate_limit:][::-1]
+        # 优化策略：取 Top 5N 候选再过滤
+        limit = min(max(top_k * 5, 50), len(self.documents))
+        # argsort 返回从小到大的索引，取最后 limit 个并反转
+        candidate_indices = np.argsort(scores)[-limit:][::-1]
 
         results = []
         for idx in candidate_indices:
-            if scores[idx] <= 0.0:
-                break
+            if scores[idx] <= 0: break # 无相关性
 
             doc = self.documents[idx]
             path = doc.metadata.get('full_path', '')
 
-            # 黑名单过滤
-            if path in blacklist_paths:
-                continue
+            if path in blacklist_paths: continue
 
             results.append(doc)
-            if len(results) >= top_k:
-                break
+            if len(results) >= top_k: break
 
         return results

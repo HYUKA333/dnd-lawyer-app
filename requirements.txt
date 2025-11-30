@@ -1,6 +1,6 @@
 #UI
 
-flet>=0.21.0
+flet==0.25.2
 
 #Core AI
 

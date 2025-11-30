@@ -9,7 +9,8 @@ from src.services.config_manager import config_manager
 class AppLayout(ft.Row):
     def __init__(self, page: ft.Page):
         super().__init__(expand=True, spacing=0)
-        self.page = page
+        # --- 修复点：改名为 main_page，避免与 Flet 内部的 self.page 冲突 ---
+        self.main_page = page
         self.session_manager = SessionManager(str(config_manager.data_dir))
 
         # 初始化 Views
