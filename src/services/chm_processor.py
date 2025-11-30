@@ -7,6 +7,7 @@ import re
 from bs4 import BeautifulSoup
 import html2text
 
+
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,8 @@ class CHMProcessor:
         """
         阶段 1: 解包与分析 (对应 analyze_chm.py)
         """
+        # === 新增：强制转为绝对路径，防止 7zip 找不到文件报 Code 2 ===
+        file_path = os.path.abspath(file_path)
         # 1. 清理环境
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
@@ -45,16 +48,27 @@ class CHMProcessor:
         # 2. 解包
         logger.info(f"正在解包 {file_path}...")
         try:
-            # 使用 list 传参防止路径空格问题
-            subprocess.run(
-                [self.seven_zip_path, "x", file_path, f"-o{self.chm_source_dir}"],
-                check=True,
+            # === 修改开始 ===
+            # 1. 移除 check=True，改为捕获返回值 result
+            # 2. 增加 "-y" 参数，强制覆盖不询问，防止后台挂起
+            result = subprocess.run(
+                [self.seven_zip_path, "x", file_path, f"-o{self.chm_source_dir}", "-y"],
+                check=False,  # 关键修改：允许返回非0代码
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE
             )
-        except subprocess.CalledProcessError as e:
-            err_msg = e.stderr.decode('gbk', errors='ignore') if e.stderr else "Unknown error"
-            raise Exception(f"7zip解包失败: {err_msg}")
+
+            # 只有当返回值 > 1 时才认为是致命错误
+            # 返回 1 (Warning) 视为成功，不抛出异常
+            if result.returncode > 1:
+                err_msg = result.stderr.decode('gbk', errors='ignore') if result.stderr else "Unknown error"
+                raise Exception(f"7zip解包错误 (Code {result.returncode}): {err_msg}")
+            # === 修改结束 ===
+
+        except Exception as e:
+            # 这里如果之前有 subprocess.CalledProcessError 的捕获逻辑，现在可以去掉了，
+            # 因为上面手动处理了错误，直接捕获 Exception 即可
+            raise Exception(f"7zip解包失败: {str(e)}")
 
         # 3. 查找 HHC 索引文件
         hhc_file = None
