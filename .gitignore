@@ -1,0 +1,9 @@
+# 默认忽略的文件
+/shelf/
+/workspace.xml
+.idea/
+__pycache__/
+*.dll
+*.exe
+bin/
+data/
