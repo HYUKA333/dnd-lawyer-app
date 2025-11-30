@@ -1,225 +1,320 @@
 import os
 import json
-import re
-import pickle
 import shutil
 import subprocess
-import html2text
-import jieba
 import logging
-from pathlib import Path
-from typing import Callable, List, Dict, Optional
+import re
 from bs4 import BeautifulSoup
-from langchain_core.documents import Document
-from rank_bm25 import BM25Okapi
+import html2text
 
-from src.services.library_manager import library_manager
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- 移植常量 ---
-SPLIT_HEURISTIC_THRESHOLD = 9
-MIN_CONTENT_LENGTH = 30
 
 class CHMProcessor:
-    def __init__(self, chm_path: str, lib_id: str):
-        self.chm_path = Path(chm_path)
-        self.lib_id = lib_id
+    def __init__(self):
+        self.base_dir = os.getcwd()
+        self.temp_dir = os.path.join(self.base_dir, "temp_chm")
+        self.output_dir = os.path.join(self.base_dir, "data")
+        self.seven_zip_path = self._get_7zip_path()
+        self.config = None
+        self.chm_source_dir = None
+        # 严格对应 analyze_chm.py 的阈值
+        self.SPLIT_HEURISTIC_THRESHOLD = 9
 
-        # 路径配置
-        self.lib_path = library_manager.get_library_path(lib_id)
-        self.source_dir = self.lib_path / "chm_source"
-        self.index_dir = self.lib_path / "vector_store"
-        self.json_path = self.lib_path / "rules_data.json"
+    def _get_7zip_path(self):
+        """获取 7zip 路径，优先使用 bin 目录"""
+        bin_path = os.path.join(self.base_dir, "bin", "7za.exe")
+        if os.path.exists(bin_path):
+            return bin_path
+        # Fallback 到系统命令
+        return "7za"
 
-        # html2text 配置
-        self.h2t = html2text.HTML2Text()
-        self.h2t.ignore_links = False
-        self.h2t.ignore_images = True
-        self.h2t.body_width = 0
-        self.h2t.protect_links = True
-        self.h2t.mark_code = True
+    def process_chm(self, file_path):
+        """
+        阶段 1: 解包与分析 (对应 analyze_chm.py)
+        """
+        # 1. 清理环境
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+        os.makedirs(self.temp_dir)
 
-    def extract_chm(self, progress_callback: Callable):
-        """解压逻辑"""
-        progress_callback(0.1, "正在解压 CHM 文件...")
-        bin_7z = Path(os.getcwd()) / "bin" / "7za.exe"
-        if not bin_7z.exists():
-            bin_7z = "7z"
+        self.chm_source_dir = os.path.join(self.temp_dir, "source")
 
-        if self.source_dir.exists():
-            shutil.rmtree(self.source_dir)
-        self.source_dir.mkdir(parents=True, exist_ok=True)
+        # 2. 解包
+        logger.info(f"正在解包 {file_path}...")
+        try:
+            # 使用 list 传参防止路径空格问题
+            subprocess.run(
+                [self.seven_zip_path, "x", file_path, f"-o{self.chm_source_dir}"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE
+            )
+        except subprocess.CalledProcessError as e:
+            err_msg = e.stderr.decode('gbk', errors='ignore') if e.stderr else "Unknown error"
+            raise Exception(f"7zip解包失败: {err_msg}")
 
-        cmd = [str(bin_7z), "x", str(self.chm_path), f"-o{self.source_dir}", "-y"]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+        # 3. 查找 HHC 索引文件
+        hhc_file = None
+        for root, _, files in os.walk(self.chm_source_dir):
+            for f in files:
+                if f.lower().endswith('.hhc'):
+                    hhc_file = os.path.join(root, f)
+                    break
+            if hhc_file: break
 
-    def analyze_top_levels(self) -> List[str]:
-        """获取顶级目录供用户选择"""
-        top_levels = []
-        for item in self.source_dir.iterdir():
-            if item.is_dir():
-                top_levels.append(item.name)
-        return sorted(top_levels)
+        if not hhc_file:
+            raise Exception("未找到 .hhc 索引文件，无法分析结构。")
 
-    def run_processing(self, selected_folders: List[str], progress_callback: Callable):
-        """执行核心处理流程"""
-        progress_callback(0.2, "开始分析文档结构与分割...")
+        # 4. 生成配置树
+        self.config = self._generate_config_logic(hhc_file)
+        return self.config
 
-        all_documents = []
-        files_to_process = []
+    def _generate_config_logic(self, hhc_path):
+        """
+        核心分析逻辑：解析 HHC -> 应用启发式算法 -> 生成 Config
+        """
+        content = self._read_file_safe(hhc_path)
+        if not content:
+            raise Exception("无法读取 HHC 文件内容")
 
-        # 1. 收集文件
-        for f in self.source_dir.glob("*.htm*"):
-            if f.is_file(): files_to_process.append(f)
-        for folder_name in selected_folders:
-            folder_path = self.source_dir / folder_name
-            if folder_path.exists():
-                files_to_process.extend(folder_path.rglob("*.htm*"))
+        soup = BeautifulSoup(content, 'html.parser')
 
-        total_files = len(files_to_process)
-        if total_files == 0:
-            raise ValueError("未找到任何 HTML 文件")
+        # 解析 HHC 获取待处理的文件列表
+        items = self._parse_hhc_items(soup)
 
-        # 2. 遍历处理
-        for i, file_path in enumerate(files_to_process):
-            if i % 20 == 0:
-                progress = 0.2 + (i / total_files) * 0.6
-                progress_callback(progress, f"处理中: {file_path.name}")
+        tree_rules = {}
+        for item in items:
+            name = item['name']
+            rel_path = item['path']
 
-            docs = self._process_single_file(file_path)
-            all_documents.extend(docs)
+            # === 核心算法：启发式判断 Split 策略 (analyze_chm.py) ===
+            split_by = self._analyze_split_strategy_strict(rel_path)
 
-        # 3. 保存与索引
-        progress_callback(0.85, f"正在生成索引 (共 {len(all_documents)} 个切片)...")
-        self._save_and_index(all_documents)
+            tree_rules[name] = {
+                "path": rel_path,
+                "action": "process",  # 默认选中
+                "split_by": split_by
+            }
 
-        # 4. 完成
-        library_manager.update_metadata(self.lib_id, doc_count=len(all_documents))
-        shutil.rmtree(self.source_dir, ignore_errors=True)
-        progress_callback(1.0, "处理完成！")
+        return {
+            "common_config": {
+                "base_url": "chm://",
+                "selector": "body"
+            },
+            "tree_processing_rules": tree_rules
+        }
 
-    def _process_single_file(self, file_path: Path) -> List[Document]:
-        content = self._read_file_encoded(file_path)
-        if not content: return []
+    def _parse_hhc_items(self, soup):
+        """
+        解析 HHC 结构。
+        为了 UI 展示简洁，目前只提取第一层级的有效 HTML 节点。
+        """
+        items = []
 
-        rel_path = file_path.relative_to(self.source_dir).as_posix()
-        file_stem = file_path.stem
+        # 尝试找到根 UL
+        root_ul = soup.find('ul')
+        target_container = root_ul if root_ul else soup
 
-        # --- 算法移植核心: 级联判断 split_by ---
-        split_tag = self._determine_split_tag(content)
+        # 仅遍历直接子节点以获取“根目录”概念
+        for li in target_container.find_all('li', recursive=False):
+            obj = li.find('object', type="text/sitemap")
+            if not obj: continue
 
-        docs = []
+            name_param = obj.find('param', {'name': 'Name'})
+            local_param = obj.find('param', {'name': 'Local'})
 
-        if split_tag:
-            # --- 算法移植核心: 正则分割 ---
-            docs = self._regex_split(content, split_tag, file_stem, rel_path)
+            if name_param and local_param:
+                path = local_param['value'].replace('\\', '/').lstrip('/')
+                # 忽略非 HTML 资源
+                if not path.lower().endswith(('.htm', '.html')):
+                    continue
+
+                items.append({
+                    'name': name_param['value'],
+                    'path': path
+                })
+
+        # 如果 HHC 结构太乱找不到 recursive=False 的，回退到搜索所有 (Fallback)
+        if not items:
+            seen_paths = set()
+            for obj in soup.find_all('object', type="text/sitemap"):
+                name_param = obj.find('param', {'name': 'Name'})
+                local_param = obj.find('param', {'name': 'Local'})
+                if name_param and local_param:
+                    path = local_param['value'].replace('\\', '/').lstrip('/')
+                    if path in seen_paths or not path.lower().endswith(('.htm', '.html')):
+                        continue
+                    seen_paths.add(path)
+                    items.append({'name': name_param['value'], 'path': path})
+            # 限制数量防止 UI 卡死
+            items = items[:100]
+
+        return items
+
+    def _analyze_split_strategy_strict(self, relative_path):
+        """
+        [严格复刻] analyze_chm.py 的启发式算法
+        优先级: H1 -> H2 -> H3 -> H4
+        """
+        full_path = os.path.join(self.chm_source_dir, relative_path)
+        if not os.path.exists(full_path):
+            return None
+
+        content = self._read_file_safe(full_path)
+        if not content: return None
+
+        soup = BeautifulSoup(content, 'html.parser')
+
+        # 统计标签数量
+        h_counts = [len(soup.find_all(f'h{i}')) for i in range(1, 7)]
+
+        # 严格的优先级判断 (analyze_chm.py 逻辑)
+        if h_counts[0] > self.SPLIT_HEURISTIC_THRESHOLD:  # H1
+            return "h1"
+        elif h_counts[1] > self.SPLIT_HEURISTIC_THRESHOLD:  # H2
+            return "h2"
+        elif h_counts[2] > self.SPLIT_HEURISTIC_THRESHOLD:  # H3
+            return "h3"
+        elif h_counts[3] > self.SPLIT_HEURISTIC_THRESHOLD:  # H4
+            return "h4"
         else:
-            # 不分割，转 Markdown
-            md_text = self._html_to_md(content)
-            if len(md_text) > MIN_CONTENT_LENGTH:
-                docs.append(Document(
-                    page_content=md_text,
-                    metadata={
-                        "source": file_stem,
-                        "title": file_stem,
-                        "full_path": rel_path,
-                        "is_chunk": False
-                    }
-                ))
-
-        return docs
-
-    def _determine_split_tag(self, html_content: str) -> Optional[str]:
-        """级联阈值判断"""
-        try:
-            soup = BeautifulSoup(html_content, "html.parser")
-            h1_count = len(soup.find_all("h1"))
-            if h1_count > SPLIT_HEURISTIC_THRESHOLD: return "h1"
-
-            h2_count = len(soup.find_all("h2"))
-            if h2_count > SPLIT_HEURISTIC_THRESHOLD: return "h2"
-
-            h3_count = len(soup.find_all("h3"))
-            if h3_count > SPLIT_HEURISTIC_THRESHOLD: return "h3"
-
-            h4_count = len(soup.find_all("h4"))
-            if h4_count > SPLIT_HEURISTIC_THRESHOLD: return "h4"
-            return None
-        except:
             return None
 
-    def _regex_split(self, content: str, tag: str, file_stem: str, rel_path: str) -> List[Document]:
-        """正则物理切割"""
-        pattern = f"(<{tag}.*?>.*?</{tag}>)"
-        chunks = re.split(pattern, content, flags=re.DOTALL | re.IGNORECASE)
+    def generate_library(self):
+        """
+        阶段 2: 打包 (对应 package_json.py)
+        """
+        if not self.config:
+            raise Exception("配置未就绪，请先运行分析")
 
-        docs = []
-        current_header = file_stem
+        output_json_path = os.path.join(self.output_dir, "rules_data.json")
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        # 处理序言
-        if chunks and chunks[0].strip():
-            md = self._html_to_md(chunks[0])
-            if len(md) > MIN_CONTENT_LENGTH:
-                docs.append(Document(
-                    page_content=md,
-                    metadata={"source": file_stem, "title": f"{file_stem} (序言)", "full_path": rel_path, "is_chunk": True}
-                ))
+        rules = self.config.get("tree_processing_rules", {})
+        all_data = []
 
-        for i in range(1, len(chunks), 2):
-            header_html = chunks[i]
-            body_html = chunks[i+1] if i+1 < len(chunks) else ""
+        for name, rule in rules.items():
+            if rule.get("action") != "process":
+                continue
 
-            try:
-                raw_title = re.sub(r"<[^>]+>", "", header_html).strip()
-                current_header = raw_title if raw_title else current_header
-            except:
-                pass
+            entries = self._process_node_package(
+                title=name,
+                relative_path=rule['path'],
+                split_by=rule.get('split_by')
+            )
+            all_data.extend(entries)
 
-            full_chunk_html = header_html + body_html
-            md_text = self._html_to_md(full_chunk_html)
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(all_data, f, ensure_ascii=False, indent=2)
 
-            if len(md_text) > MIN_CONTENT_LENGTH:
-                docs.append(Document(
-                    page_content=md_text,
-                    metadata={
-                        "source": file_stem,
-                        "title": current_header,
-                        "full_path": rel_path,
-                        "is_chunk": True
-                    }
-                ))
+        return output_json_path
 
-        return docs
+    def _process_node_package(self, title, relative_path, split_by):
+        """处理单个文件节点：读取 -> 正则分割 -> Md转换"""
+        full_path = os.path.join(self.chm_source_dir, relative_path)
+        if not os.path.exists(full_path):
+            return []
 
-    def _html_to_md(self, html: str) -> str:
+        html_content = self._read_file_safe(full_path)
+        if not html_content: return []
+
+        # 1. Regex 分割 (复刻 V3/V5)
+        if split_by:
+            chunks = self._split_content_regex(html_content, split_by)
+        else:
+            chunks = [{"sub_title": "", "content": html_content}]
+
+        entries = []
+        for chunk in chunks:
+            # 2. Html2Text 转换
+            md_text = self._convert_html_to_md(chunk["content"])
+
+            if not md_text.strip(): continue
+
+            # 构建完整标题
+            final_title = title
+            if chunk["sub_title"] and chunk["sub_title"] != "Intro":
+                final_title = f"{title} - {chunk['sub_title']}"
+
+            entries.append({
+                "title": final_title,
+                "content": md_text,
+                "source": relative_path
+            })
+
+        return entries
+
+    def _split_content_regex(self, html_content, tag_name):
+        """
+        [关键逻辑] 基于正则的字符串分割 (复刻 package_json.py)
+        保留 <tag>...</tag> 及其内容。
+        """
+        # Pattern: (<tag\b[^>]*>.*?</tag>)
+        # re.DOTALL 确保 . 匹配换行符
+        # re.IGNORECASE 忽略大小写
+        pattern = f"(<{tag_name}\\b[^>]*>.*?</{tag_name}>)"
+
+        parts = re.split(pattern, html_content, flags=re.DOTALL | re.IGNORECASE)
+
+        results = []
+
+        # Part 0 是第一个 header 之前的内容 (Intro)
+        if parts[0].strip():
+            results.append({"sub_title": "Intro", "content": parts[0]})
+
+        # 后续是 delimiter (标题HTML) 和 content (正文) 交替
+        # parts[1] = header, parts[2] = body, parts[3] = header, ...
+        for i in range(1, len(parts), 2):
+            if i + 1 >= len(parts): break  # 防止越界
+
+            header_html = parts[i]
+            body_html = parts[i + 1]
+
+            # 提取纯文本标题
+            soup_header = BeautifulSoup(header_html, 'html.parser')
+            clean_title = soup_header.get_text(" ", strip=True)
+
+            # 组合内容：将 header 放回 body 开头，以便 Markdown 保留层级
+            combined = header_html + "\n" + body_html
+
+            results.append({
+                "sub_title": clean_title,
+                "content": combined
+            })
+
+        return results
+
+    def _convert_html_to_md(self, html_content):
+        """配置 html2text (复刻 package_json.py)"""
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_tables = False  # 必须保留表格
+        h.body_width = 0  # 不强制折行
+        h.protect_links = True
+        h.unicode_snob = True
+
         try:
-            return self.h2t.handle(html).strip()
-        except:
-            return ""
+            return h.handle(html_content)
+        except Exception as e:
+            logger.error(f"Markdown conversion error: {e}")
+            return BeautifulSoup(html_content, 'html.parser').get_text()
 
-    def _read_file_encoded(self, path: Path) -> str:
+    def _read_file_safe(self, path):
+        """多编码读取尝试 (复刻 analyze_chm.py 的健壮性)"""
         try:
-            with open(path, "rb") as f:
+            with open(path, 'rb') as f:
                 raw = f.read()
-            if raw.startswith(b"\xef\xbb\xbf"): return raw.decode("utf-8-sig")
-            for enc in ["utf-8", "gb18030", "gbk", "big5", "latin-1"]:
+            # 常见中文编码尝试顺序
+            encodings = ['utf-8-sig', 'utf-8', 'gb18030', 'gbk', 'big5', 'utf-16']
+            for enc in encodings:
                 try:
                     return raw.decode(enc)
                 except:
                     continue
-            return ""
-        except:
-            return ""
-
-    def _save_and_index(self, documents: List[Document]):
-        data_to_save = [{"page_content": d.page_content, "metadata": d.metadata} for d in documents]
-        with open(self.json_path, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, ensure_ascii=False)
-
-        tokenized_corpus = [jieba.lcut(d.page_content) for d in documents]
-        bm25 = BM25Okapi(tokenized_corpus)
-
-        with open(self.index_dir / "documents.pkl", "wb") as f:
-            pickle.dump(documents, f)
-
-        with open(self.index_dir / "bm25_model.pkl", "wb") as f:
-            pickle.dump(bm25, f)
+            return raw.decode('utf-8', errors='ignore')
+        except Exception:
+            return None

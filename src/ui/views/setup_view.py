@@ -18,7 +18,7 @@ class SetupView(ft.Container):
         )
         self.api_key = ft.TextField(label="API Key", password=True, can_reveal_password=True, width=400)
         self.base_url = ft.TextField(label="API Base URL (OpenAI 模式必填)", width=400)
-        self.model_name = ft.TextField(label="模型名称 (例如 gpt-4o, gemini-1.5-flash)", value="gemini-1.5-flash",
+        self.model_name = ft.TextField(label="模型名称 (例如 gpt-4o, gemini-2.5-flash)", value="gemini-2.5-flash",
                                        width=400)
         self.temperature = ft.Slider(min=0, max=1, divisions=10, label="温度: {value}", value=0.1, width=400)
 
